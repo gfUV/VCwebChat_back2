@@ -153,6 +153,7 @@ export class ChatController {
       id: uuidv4(),
       roomId: rid,
       senderId: ws.userId ?? payload?.senderId ?? "anonymous",
+      senderName: payload?.senderName,  // ✅ NUEVO CAMPO AGREGADO
       type: "chat",
       content: String(payload?.text ?? ""),
       timestamp: Date.now(),

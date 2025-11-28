@@ -12,6 +12,14 @@ dotenv.config();
 
 const PORT = Number(process.env.PORT ?? 4000);
 
+// ✅ AGREGAR: Lista de orígenes permitidos
+const ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://v-cweb-front.vercel.app',
+  'https://vcweb-front.vercel.app'
+];
+
 async function start() {
   // Create express app
   const app = createApp();
@@ -32,7 +40,21 @@ async function start() {
 
   // Handle WebSocket upgrade requests
   server.on("upgrade", (request, socket, head) => {
-    // Optional: validate Firebase token in this block
+    // ✅ AGREGAR: Validar origen
+    const origin = request.headers.origin;
+    
+    // Permitir conexiones sin origen (como desde Postman/test local)
+    // O verificar que el origen esté en la lista permitida
+    const isAllowed = !origin || ALLOWED_ORIGINS.some(allowed => 
+      origin.startsWith(allowed) || allowed.includes('*')
+    );
+
+    if (!isAllowed) {
+      logger.warn(`WebSocket connection rejected from origin: ${origin}`);
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
       // Extract userId from query string (optional)

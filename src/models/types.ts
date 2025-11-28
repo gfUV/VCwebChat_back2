@@ -24,6 +24,9 @@ export interface IMessage {
   /** ID of the user sending the message. */
   senderId: string;
 
+  /** Display name of the user sending the message. */
+  senderName?: string;  // ✅ NUEVO CAMPO AGREGADO
+
   /** Type of message (e.g., "chat", "system", "signal"). */
   type: string;
 
