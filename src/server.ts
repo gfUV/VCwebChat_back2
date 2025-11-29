@@ -6,13 +6,14 @@ import { createApp } from "./app";
 import { ChatController } from "./controllers/chatController";
 import { ChatService } from "./services/chatService";
 import { MessageDAO } from "./dao/messageDAO";
+import { MeetingValidationService } from "./services/meetingValidationService";
 import { logger } from "./utils/logger";
 
 dotenv.config();
 
 const PORT = Number(process.env.PORT ?? 4000);
 
-// ✅ AGREGAR: Lista de orígenes permitidos
+// ✅ Lista de orígenes permitidos
 const ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'http://localhost:3000',
@@ -30,7 +31,8 @@ async function start() {
   // Prepare dependencies for controller
   const dao = new MessageDAO();
   const service = new ChatService(dao);
-  const controller = new ChatController(service);
+  const meetingService = new MeetingValidationService();
+  const controller = new ChatController(service, meetingService);
 
   // Create WebSocket server
   const wss = new WebSocketServer({ noServer: true });
@@ -40,12 +42,12 @@ async function start() {
 
   // Handle WebSocket upgrade requests
   server.on("upgrade", (request, socket, head) => {
-    // ✅ AGREGAR: Validar origen
+    // ✅ Validar origen
     const origin = request.headers.origin;
-    
+
     // Permitir conexiones sin origen (como desde Postman/test local)
     // O verificar que el origen esté en la lista permitida
-    const isAllowed = !origin || ALLOWED_ORIGINS.some(allowed => 
+    const isAllowed = !origin || ALLOWED_ORIGINS.some(allowed =>
       origin.startsWith(allowed) || allowed.includes('*')
     );
 
@@ -67,7 +69,7 @@ async function start() {
   });
 
   // When a WebSocket connects
-  wss.on("connection", (ws: WebSocket & { userId?: string }) => {
+  wss.on("connection", (ws: WebSocket & { userId?: string; roomId?: string }) => {
     logger.info("WebSocket connected:", ws.userId ?? "unknown");
 
     ws.on("message", async (data) => {
@@ -78,14 +80,23 @@ async function start() {
       }
     });
 
-    ws.on("close", () => {
+    // ✅ MODIFICADO: Ahora llama a handleDisconnect del controller
+    ws.on("close", async () => {
       logger.info("WebSocket disconnected:", ws.userId ?? "unknown");
+      await controller.handleDisconnect(ws);
+    });
+
+    // ✅ NUEVO: Manejo de errores del WebSocket
+    ws.on("error", (error) => {
+      logger.error("WebSocket error:", error);
     });
   });
 
   // Start server
   server.listen(PORT, () => {
     logger.info(`🚀 Server running on port ${PORT}`);
+    logger.info(`📡 WebSocket server ready`);
+    logger.info(`🔗 Backend 1 URL: ${process.env.BACKEND1_URL || 'http://localhost:3000'}`);
   });
 }
 

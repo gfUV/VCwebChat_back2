@@ -1,21 +1,30 @@
 import { WebSocket } from "ws";
 import { ChatService } from "../services/chatService";
+import { MeetingValidationService } from "../services/meetingValidationService";
 import type { IWebSocketEnvelope, IMessage } from "../models/types";
 import { v4 as uuidv4 } from "uuid";
+import { logger } from "../utils/logger";
 
 /**
  * ChatController
  * Handles incoming WebSocket messages, routing them to the appropriate
  * business logic in ChatService, and manages WebRTC signaling messages.
+ * Now includes real-time participant validation with Backend 1.
  */
 export class ChatController {
   private service: ChatService;
+  private meetingService: MeetingValidationService;
 
   /**
    * @param service ChatService dependency (Dependency Injection friendly)
+   * @param meetingService MeetingValidationService for Backend 1 communication
    */
-  constructor(service?: ChatService) {
+  constructor(
+    service?: ChatService,
+    meetingService?: MeetingValidationService
+  ) {
     this.service = service ?? new ChatService();
+    this.meetingService = meetingService ?? new MeetingValidationService();
   }
 
   /**
@@ -72,41 +81,147 @@ export class ChatController {
   }
 
   /**
-   * Handles a client joining a chat room.
+   * Handles a client joining a chat room with real-time validation.
    *
    * @param ws WebSocket client
-   * @param payload Incoming payload containing `roomId`
+   * @param payload Incoming payload containing `roomId` and `userId`
    */
-  private async handleJoin(ws: WebSocket & { roomId?: string }, payload: any) {
+  private async handleJoin(
+    ws: WebSocket & { roomId?: string; userId?: string },
+    payload: any
+  ) {
     const roomId = payload?.roomId;
+    const userId = payload?.userId;
 
     if (!roomId) {
       ws.send(
         JSON.stringify({
           action: "error",
-          payload: "roomId-required",
+          payload: {
+            message: "roomId-required",
+            code: "ROOMID_REQUIRED",
+          },
         })
       );
       return;
     }
 
-    ws.roomId = roomId;
+    try {
+      // PASO 1: Validar reunión con Backend 1
+      const meetingData = await this.meetingService.getMeeting(roomId);
 
-    ws.send(
-      JSON.stringify({
-        action: "joined",
-        payload: { roomId },
-      })
-    );
+      if (!meetingData || !meetingData.success) {
+        ws.send(
+          JSON.stringify({
+            action: "join-error",
+            payload: {
+              message: "Reunión no encontrada",
+              code: "MEETING_NOT_FOUND",
+            },
+          })
+        );
+        logger.warn(`Join rejected: Meeting ${roomId} not found`);
+        return;
+      }
 
-    // Load and send recent messages
-    const recent = await this.service.getRecent(roomId);
-    ws.send(
-      JSON.stringify({
-        action: "recent-messages",
-        payload: recent,
-      })
-    );
+      if (!meetingData.meeting?.isActive) {
+        ws.send(
+          JSON.stringify({
+            action: "join-error",
+            payload: {
+              message: "La reunión ya no está activa",
+              code: "MEETING_INACTIVE",
+            },
+          })
+        );
+        logger.warn(`Join rejected: Meeting ${roomId} is inactive`);
+        return;
+      }
+
+      // PASO 2: Validar límite EN TIEMPO REAL (contar WebSockets activos)
+      const currentParticipants = this.getRoomParticipantCount(roomId);
+      const maxParticipants = meetingData.meeting.maxParticipants;
+
+      logger.info(
+        `Room ${roomId}: ${currentParticipants}/${maxParticipants} participants`
+      );
+
+      if (currentParticipants >= maxParticipants) {
+        ws.send(
+          JSON.stringify({
+            action: "join-error",
+            payload: {
+              message: `Reunión llena (${maxParticipants}/${maxParticipants} participantes)`,
+              code: "MEETING_FULL",
+              current: currentParticipants,
+              max: maxParticipants,
+            },
+          })
+        );
+        logger.warn(
+          `Join rejected: Room ${roomId} is full (${currentParticipants}/${maxParticipants})`
+        );
+        return;
+      }
+
+      // PASO 3: Permitir que se una a la sala
+      ws.roomId = roomId;
+      if (userId) ws.userId = userId;
+
+      // Notificar a otros en la sala
+      this.broadcastToRoom(
+        roomId,
+        {
+          action: "user-joined",
+          payload: {
+            userId: ws.userId || "anonymous",
+            socketId: ws.userId,
+            participantCount: currentParticipants + 1,
+          },
+        },
+        ws
+      );
+
+      // Confirmar al usuario que se unió
+      ws.send(
+        JSON.stringify({
+          action: "joined",
+          payload: {
+            roomId,
+            participantCount: currentParticipants + 1,
+            maxParticipants,
+          },
+        })
+      );
+
+      // Load and send recent messages
+      const recent = await this.service.getRecent(roomId);
+      ws.send(
+        JSON.stringify({
+          action: "recent-messages",
+          payload: recent,
+        })
+      );
+
+      // PASO 4: Actualizar contador en Backend 1
+      const newCount = this.getRoomParticipantCount(roomId);
+      await this.meetingService.updateParticipantCount(roomId, newCount);
+
+      logger.info(
+        `✅ User ${userId || "anonymous"} joined room ${roomId} (${newCount}/${maxParticipants})`
+      );
+    } catch (error) {
+      logger.error("Error in handleJoin:", error);
+      ws.send(
+        JSON.stringify({
+          action: "join-error",
+          payload: {
+            message: "Error al unirse a la reunión",
+            code: "SERVER_ERROR",
+          },
+        })
+      );
+    }
   }
 
   /**
@@ -114,7 +229,33 @@ export class ChatController {
    *
    * @param ws WebSocket client
    */
-  private async handleLeave(ws: WebSocket & { roomId?: string }) {
+  private async handleLeave(ws: WebSocket & { roomId?: string; userId?: string }) {
+    const roomId = ws.roomId;
+
+    if (roomId) {
+      // Notificar a la sala
+      this.broadcastToRoom(
+        roomId,
+        {
+          action: "user-left",
+          payload: {
+            userId: ws.userId || "anonymous",
+            socketId: ws.userId,
+            participantCount: this.getRoomParticipantCount(roomId) - 1,
+          },
+        },
+        ws
+      );
+
+      // Actualizar contador en Backend 1
+      const newCount = Math.max(0, this.getRoomParticipantCount(roomId) - 1);
+      await this.meetingService.updateParticipantCount(roomId, newCount);
+
+      logger.info(
+        `User ${ws.userId || "anonymous"} left room ${roomId}, ${newCount} participants remaining`
+      );
+    }
+
     delete ws.roomId;
 
     ws.send(
@@ -153,7 +294,7 @@ export class ChatController {
       id: uuidv4(),
       roomId: rid,
       senderId: ws.userId ?? payload?.senderId ?? "anonymous",
-      senderName: payload?.senderName,  // ✅ NUEVO CAMPO AGREGADO
+      senderName: payload?.senderName,
       type: "chat",
       content: String(payload?.text ?? ""),
       timestamp: Date.now(),
@@ -203,6 +344,55 @@ export class ChatController {
       },
       ws
     );
+  }
+
+  /**
+   * Counts the number of active WebSocket connections in a room.
+   *
+   * @param roomId Room identifier
+   * @returns Number of active connections
+   */
+  private getRoomParticipantCount(roomId: string): number {
+    const wss = (this as any).wss;
+    if (!wss) return 0;
+
+    let count = 0;
+    wss.clients.forEach((client: WebSocket & { roomId?: string }) => {
+      if (client.readyState === 1 && client.roomId === roomId) {
+        count++;
+      }
+    });
+
+    return count;
+  }
+
+  /**
+   * Handles WebSocket disconnection and updates participant count.
+   *
+   * @param ws WebSocket client that disconnected
+   */
+  async handleDisconnect(ws: WebSocket & { roomId?: string; userId?: string }) {
+    const roomId = ws.roomId;
+
+    if (roomId) {
+      // Notificar a la sala
+      this.broadcastToRoom(roomId, {
+        action: "user-left",
+        payload: {
+          userId: ws.userId || "anonymous",
+          socketId: ws.userId,
+          participantCount: this.getRoomParticipantCount(roomId),
+        },
+      });
+
+      // Actualizar contador en Backend 1
+      const newCount = this.getRoomParticipantCount(roomId);
+      await this.meetingService.updateParticipantCount(roomId, newCount);
+
+      logger.info(
+        `User ${ws.userId || "anonymous"} disconnected from ${roomId}, ${newCount} participants remaining`
+      );
+    }
   }
 
   /**
